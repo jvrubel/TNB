@@ -11,14 +11,19 @@ import software.tnb.product.git.MavenGitRepository;
 import software.tnb.product.integration.builder.AbstractGitIntegrationBuilder;
 import software.tnb.product.integration.builder.AbstractIntegrationBuilder;
 import software.tnb.product.integration.builder.AbstractMavenGitIntegrationBuilder;
+import software.tnb.product.integration.builder.CamelJBangIntegrationBuilder;
 import software.tnb.product.integration.generator.IntegrationGenerator;
 import software.tnb.product.log.stream.LogStream;
 import software.tnb.product.util.maven.BuildRequest;
 import software.tnb.product.util.maven.Maven;
 
 import org.apache.commons.io.FileUtils;
+import org.apache.maven.model.BuildBase;
 import org.apache.maven.model.Dependency;
 import org.apache.maven.model.Model;
+import org.apache.maven.model.Plugin;
+import org.apache.maven.model.PluginExecution;
+import org.apache.maven.model.Profile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,6 +38,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 public abstract class SpringBootApp extends App {
     private static final Logger LOG = LoggerFactory.getLogger(SpringBootApp.class);
@@ -48,60 +54,84 @@ public abstract class SpringBootApp extends App {
     public SpringBootApp(AbstractIntegrationBuilder<?> integrationBuilder) {
         super(integrationBuilder);
 
-        if (integrationBuilder instanceof AbstractGitIntegrationBuilder<?>
-            && ((AbstractGitIntegrationBuilder<?>) integrationBuilder).getRepositoryUrl() != null) {
-            mavenGitApp = new MavenGitRepository((AbstractMavenGitIntegrationBuilder<?>) integrationBuilder
-                , name, getLogPath(Phase.BUILD)
-                , ((AbstractMavenGitIntegrationBuilder<?>) integrationBuilder).buildProject());
-            shouldRun = ((AbstractGitIntegrationBuilder<?>) integrationBuilder).runApplication();
-        } else if (getExistingJar(integrationBuilder) == null) {
-            LOG.info("Creating Camel Spring Boot application project for integration {}", name);
+        // If there is an existing jar defined, don't create a new app
+        if (getExistingJar() == null) {
+            if (integrationBuilder instanceof AbstractGitIntegrationBuilder<?>
+                && ((AbstractGitIntegrationBuilder<?>) integrationBuilder).getRepositoryUrl() != null) {
+                mavenGitApp = new MavenGitRepository((AbstractMavenGitIntegrationBuilder<?>) integrationBuilder
+                    , name, getLogPath(Phase.BUILD)
+                    , ((AbstractMavenGitIntegrationBuilder<?>) integrationBuilder).buildProject());
+                shouldRun = ((AbstractGitIntegrationBuilder<?>) integrationBuilder).runApplication();
+            } else {
+                if (integrationBuilder instanceof CamelJBangIntegrationBuilder) {
+                    createUsingJBang();
+                } else {
+                    createUsingMaven();
+                }
 
-            Map<String, String> properties = new HashMap<>(13);
-            properties.putAll(Map.of(
-                "archetypeGroupId", SpringBootConfiguration.camelSpringBootArchetypeGroupId(),
-                "archetypeArtifactId", SpringBootConfiguration.camelSpringBootArchetypeArtifactId(),
-                "archetypeVersion", SpringBootConfiguration.camelSpringBootArchetypeVersion(),
-                "groupId", TestConfiguration.appGroupId(),
-                "artifactId", name,
-                "version", SpringBootConfiguration.camelSpringBootArchetypeGeneratedVersion(),
-                "package", TestConfiguration.appGroupId()));
-            properties.put("archetypeCatalog", "internal");
+                final Path basePath = TestConfiguration.appLocation().resolve(name);
 
-            Maven.invoke(new BuildRequest.Builder()
-                .withBaseDirectory(TestConfiguration.appLocation())
-                .withGoals("archetype:generate")
-                .withProperties(properties)
-                .withLogFile(getLogPath(Phase.GENERATE))
-                .withLogMarker(LogStream.marker(name, Phase.GENERATE))
-                .build());
+                removeExistingTests(basePath);
 
-            final Path basePath = TestConfiguration.appLocation().resolve(name);
+                keepWebLayerOnlyForOcp(OpenshiftConfiguration.isOpenshift(), basePath);
 
-            removeExistingTests(basePath);
+                IntegrationGenerator.createFiles(integrationBuilder, basePath);
 
-            keepWebLayerOnlyForOcp(OpenshiftConfiguration.isOpenshift(), basePath);
+                customizeMain(basePath);
 
-            IntegrationGenerator.toFile(integrationBuilder, basePath);
+                customizeDependencies(integrationBuilder.getDependencies());
 
-            customizeMain(integrationBuilder, basePath);
+                createOpenshiftProfileIfNotPresent(basePath);
 
-            customizeDependencies(integrationBuilder.getDependencies());
+                customizePlugins(integrationBuilder.getPlugins());
 
-            customizePlugins(integrationBuilder.getPlugins());
+                BuildRequest.Builder requestBuilder = new BuildRequest.Builder()
+                    .withBaseDirectory(basePath)
+                    .withGoals("clean", "package")
+                    .withProperties(Map.of(
+                        "skipTests", "true"
+                    ))
+                    .withLogFile(getLogPath(Phase.BUILD))
+                    .withLogMarker(LogStream.marker(name, Phase.BUILD));
 
-            BuildRequest.Builder requestBuilder = new BuildRequest.Builder()
-                .withBaseDirectory(basePath)
-                .withGoals("clean", "package")
-                .withProperties(Map.of(
-                    "skipTests", "true"
-                ))
-                .withLogFile(getLogPath(Phase.BUILD))
-                .withLogMarker(LogStream.marker(name, Phase.BUILD));
-
-            LOG.info("Building {} application project", name);
-            Maven.invoke(requestBuilder.build());
+                LOG.info("Building {} application project", name);
+                Maven.invoke(requestBuilder.build());
+            }
         }
+    }
+
+    private void createUsingJBang() {
+        List<String> arguments = new ArrayList<>(List.of(
+            "--runtime", "spring-boot",
+            // Align the generated CamelApplication class to correct package
+            "--package-name", TestConfiguration.appGroupId()
+            // todo
+            //                    "--camel-spring-boot-version", SpringBootConfiguration.camelSpringBootVersion(),
+            //                    "--spring-boot-version", SpringBootConfiguration.springBootVersion(),
+        ));
+        super.createUsingJBang(arguments);
+    }
+
+    private void createUsingMaven() {
+        LOG.info("Creating Camel SpringBoot application project for integration {}", name);
+        Map<String, String> properties = new HashMap<>(13);
+        properties.putAll(Map.of(
+            "archetypeGroupId", SpringBootConfiguration.camelSpringBootArchetypeGroupId(),
+            "archetypeArtifactId", SpringBootConfiguration.camelSpringBootArchetypeArtifactId(),
+            "archetypeVersion", SpringBootConfiguration.camelSpringBootArchetypeVersion(),
+            "groupId", TestConfiguration.appGroupId(),
+            "artifactId", name,
+            "version", TestConfiguration.appVersion(),
+            "package", TestConfiguration.appGroupId()));
+        properties.put("archetypeCatalog", "internal");
+
+        Maven.invoke(new BuildRequest.Builder()
+            .withBaseDirectory(TestConfiguration.appLocation())
+            .withGoals("archetype:generate")
+            .withProperties(properties)
+            .withLogFile(getLogPath(Phase.GENERATE))
+            .withLogMarker(LogStream.marker(name, Phase.GENERATE))
+            .build());
     }
 
     private void keepWebLayerOnlyForOcp(boolean isOpenShift, Path location) {
@@ -121,7 +151,6 @@ public abstract class SpringBootApp extends App {
         });
 
         Maven.writePom(pom, model);
-
     }
 
     private void removeExistingTests(final Path location) {
@@ -132,14 +161,13 @@ public abstract class SpringBootApp extends App {
             basePackagePath = basePackagePath.resolve(aPackage);
         }
         final Path finalBasePackagePath = basePackagePath;
-        List.of("MySpringBean.java", "MySpringBootRouter.java")
-            .stream()
+        Stream.of("MySpringBean.java", "MySpringBootRouter.java")
             .map(f -> finalBasePackagePath.resolve(f).toFile())
             .filter(File::exists)
             .forEach(File::delete);
     }
 
-    protected Path getExistingJar(AbstractIntegrationBuilder<?> integrationBuilder) {
+    protected Path getExistingJar() {
         return integrationBuilder instanceof SpringBootIntegrationBuilder
             ? ((SpringBootIntegrationBuilder) integrationBuilder).getExistingJar() : null;
     }
@@ -153,7 +181,7 @@ public abstract class SpringBootApp extends App {
         Maven.writePom(pom, model);
     }
 
-    private void customizeMain(AbstractIntegrationBuilder<?> integrationBuilder, Path location) {
+    private void customizeMain(Path location) {
         if (integrationBuilder instanceof SpringBootIntegrationBuilder) {
             addXmlResourceImport((SpringBootIntegrationBuilder) integrationBuilder, location);
         }
@@ -197,6 +225,32 @@ public abstract class SpringBootApp extends App {
                 throw new RuntimeException("Cannot parse "
                     + TestConfiguration.appLocation().resolve(springBootMainClass).toAbsolutePath(), e);
             }
+        }
+    }
+
+    private void createOpenshiftProfileIfNotPresent(Path location) {
+        File pom = location.resolve("pom.xml").toFile();
+        Model model = Maven.loadPom(pom);
+
+        if (model.getProfiles().stream().noneMatch(p -> "openshift".equals(p.getId()))) {
+            Profile profile = new Profile();
+            profile.setId("openshift");
+            BuildBase build = new BuildBase();
+            build.setDefaultGoal("install");
+
+            Plugin plugin = new Plugin();
+            plugin.setGroupId(SpringBootConfiguration.openshiftMavenPluginGroupId());
+            plugin.setArtifactId(SpringBootConfiguration.openshiftMavenPluginArtifactId());
+            plugin.setVersion(SpringBootConfiguration.openshiftMavenPluginVersion());
+
+            PluginExecution execution = new PluginExecution();
+            execution.setGoals(List.of("resource", "build", "apply"));
+            plugin.setExecutions(List.of(execution));
+
+            build.setPlugins(List.of(plugin));
+            profile.setBuild(build);
+            model.getProfiles().add(profile);
+            Maven.writePom(pom, model);
         }
     }
 }

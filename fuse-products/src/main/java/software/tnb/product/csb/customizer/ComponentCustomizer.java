@@ -1,5 +1,6 @@
 package software.tnb.product.csb.customizer;
 
+import software.tnb.product.integration.builder.CamelJBangIntegrationBuilder;
 import software.tnb.product.util.jparser.AnnotationUtils;
 
 import java.util.List;
@@ -11,7 +12,10 @@ public class ComponentCustomizer extends SpringBootCustomizer {
 
     @Override
     public void customize() {
-        getIntegrationBuilder().getRouteBuilder().ifPresent(rb ->
-            AnnotationUtils.addAnnotationsToRouteBuilder(rb, List.of("org.springframework.stereotype.Component"), List.of("Component")));
+        // Camel export using JBang adds the annotation automatically
+        if (!(getIntegrationBuilder() instanceof CamelJBangIntegrationBuilder)) {
+            getIntegrationBuilder().getRouteBuilder().ifPresent(rb ->
+                AnnotationUtils.addAnnotationsToRouteBuilder(rb, List.of("org.springframework.stereotype.Component"), List.of("Component")));
+        }
     }
 }
